@@ -58,6 +58,8 @@ static struct {
 	USBDK_SET_ALTSETTING			SetAltsetting;
 	USBDK_RESET_DEVICE			ResetDevice;
 	USBDK_GET_REDIRECTOR_SYSTEM_HANDLE	GetRedirectorSystemHandle;
+	USBDK_GET_REDIRECTOR_CAPABILITIES		GetRedirectorCapabilities;
+	USBDK_SET_CONFIGURATION			SetConfiguration;
 } usbdk_helper;
 
 static FARPROC get_usbdk_proc_addr(struct libusb_context *ctx, LPCSTR api_name)
@@ -137,6 +139,10 @@ static int load_usbdk_helper_dll(struct libusb_context *ctx)
 	usbdk_helper.GetRedirectorSystemHandle = (USBDK_GET_REDIRECTOR_SYSTEM_HANDLE)get_usbdk_proc_addr(ctx, "UsbDk_GetRedirectorSystemHandle");
 	if (usbdk_helper.GetRedirectorSystemHandle == NULL)
 		goto error_unload;
+
+	/* These exports are optional so that existing helpers can still enumerate. */
+	usbdk_helper.GetRedirectorCapabilities = (USBDK_GET_REDIRECTOR_CAPABILITIES)GetProcAddress(usbdk_helper.module, "UsbDk_GetRedirectorCapabilities");
+	usbdk_helper.SetConfiguration = (USBDK_SET_CONFIGURATION)GetProcAddress(usbdk_helper.module, "UsbDk_SetConfiguration");
 
 	return LIBUSB_SUCCESS;
 
@@ -271,7 +277,8 @@ static inline int usbdk_device_priv_init(struct libusb_context *ctx, struct libu
 	struct usbdk_device_priv *priv = usbi_get_device_priv(dev);
 
 	priv->ID = info->ID;
-	priv->active_configuration = 0;
+	priv->active_configuration = info->DeviceDescriptor.bNumConfigurations ? 0 : UINT8_MAX;
+	priv->configuration_valid = true;
 
 	return usbdk_cache_config_descriptors(ctx, priv, info);
 }
@@ -398,6 +405,10 @@ static int usbdk_get_active_config_descriptor(struct libusb_device *dev, void *b
 {
 	struct usbdk_device_priv *priv = usbi_get_device_priv(dev);
 
+	if (!priv->configuration_valid)
+		return LIBUSB_ERROR_IO;
+	if (priv->active_configuration >= dev->device_descriptor.bNumConfigurations)
+		return LIBUSB_ERROR_NOT_FOUND;
 	return usbdk_get_config_descriptor(dev, priv->active_configuration, buffer, len);
 }
 
@@ -408,6 +419,7 @@ static int usbdk_open(struct libusb_device_handle *dev_handle)
 	struct windows_context_priv *priv = usbi_get_context_priv(ctx);
 	struct usbdk_device_priv *device_priv = usbi_get_device_priv(dev);
 
+	device_priv->configuration_valid = false;
 	device_priv->redirector_handle = usbdk_helper.StartRedirect(&device_priv->ID);
 	if (device_priv->redirector_handle == INVALID_HANDLE_VALUE) {
 		usbi_err(ctx, "Redirector startup failed");
@@ -425,6 +437,10 @@ static int usbdk_open(struct libusb_device_handle *dev_handle)
 		return LIBUSB_ERROR_OTHER;
 	}
 
+	/* UsbDk starts a redirector in its first configuration, independently of a
+	 * previous handle's selection. Keep that initial descriptor behavior. */
+	device_priv->active_configuration = dev->device_descriptor.bNumConfigurations ? 0 : UINT8_MAX;
+	device_priv->configuration_valid = true;
 	return LIBUSB_SUCCESS;
 }
 
@@ -437,28 +453,107 @@ static void usbdk_close(struct libusb_device_handle *dev_handle)
 
 	priv->system_handle = NULL;
 	priv->redirector_handle = NULL;
+	priv->configuration_valid = false;
 }
 
 static int usbdk_get_configuration(struct libusb_device_handle *dev_handle, uint8_t *config)
 {
 	struct usbdk_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
 
-	*config = priv->active_configuration;
+	if (!priv->configuration_valid)
+		return LIBUSB_ERROR_IO;
+	*config = priv->active_configuration == UINT8_MAX ? 0 :
+		priv->config_descriptors[priv->active_configuration]->bConfigurationValue;
 
 	return LIBUSB_SUCCESS;
 }
 
 static int usbdk_set_configuration(struct libusb_device_handle *dev_handle, uint8_t config)
 {
-	UNUSED(dev_handle);
-	UNUSED(config);
-	return LIBUSB_SUCCESS;
+	struct usbdk_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
+	struct windows_device_handle_priv *handle_priv = usbi_get_device_handle_priv(dev_handle);
+	USB_DK_REDIRECTOR_CAPABILITIES caps = { sizeof(caps), 0, 0, 0 };
+	uint8_t index = UINT8_MAX;
+	int r = LIBUSB_SUCCESS;
+	DWORD error;
+
+	if (config) {
+		for (index = 0; index < dev_handle->dev->device_descriptor.bNumConfigurations; index++)
+			if (priv->config_descriptors[index]->bConfigurationValue == config)
+				break;
+		if (index == dev_handle->dev->device_descriptor.bNumConfigurations)
+			return LIBUSB_ERROR_NOT_FOUND;
+	}
+
+	/* Submission joins this list under the same lock, before it reaches a pipe. */
+	usbi_mutex_lock(&dev_handle->lock);
+	if (!usbi_atomic_load(&dev_handle->dev->attached) || !priv->redirector_handle) {
+		r = LIBUSB_ERROR_NO_DEVICE;
+		goto out;
+	}
+	if (dev_handle->claimed_interfaces || !list_empty(&handle_priv->active_transfers)) {
+		r = LIBUSB_ERROR_BUSY;
+		goto out;
+	}
+	if (!usbdk_helper.GetRedirectorCapabilities || !usbdk_helper.SetConfiguration) {
+		r = LIBUSB_ERROR_NOT_SUPPORTED;
+		goto out;
+	}
+	SetLastError(ERROR_SUCCESS);
+	if (!usbdk_helper.GetRedirectorCapabilities(priv->redirector_handle, &caps))
+		goto helper_error;
+	if (caps.Size != sizeof(caps) || caps.ProtocolVersion != USBDK_REDIRECTOR_PROTOCOL_VERSION ||
+		!(caps.Capabilities & USBDK_CAP_SET_CONFIGURATION) || caps.Reserved) {
+		r = LIBUSB_ERROR_NOT_SUPPORTED;
+		goto out;
+	}
+	SetLastError(ERROR_SUCCESS);
+	if (!usbdk_helper.SetConfiguration(priv->redirector_handle, config)) {
+		/* A failed hardware transition cannot certify the old endpoint map. */
+		priv->configuration_valid = false;
+		goto helper_error;
+	}
+	priv->active_configuration = index;
+	priv->configuration_valid = true;
+	goto out;
+
+helper_error:
+	error = GetLastError();
+	switch (error) {
+	case ERROR_INVALID_FUNCTION:
+	case ERROR_NOT_SUPPORTED:
+	case ERROR_CALL_NOT_IMPLEMENTED:
+		r = LIBUSB_ERROR_NOT_SUPPORTED;
+		break;
+	case ERROR_INVALID_HANDLE:
+	case ERROR_FILE_NOT_FOUND:
+	case ERROR_DEVICE_NOT_CONNECTED:
+	case ERROR_NO_SUCH_DEVICE:
+		r = LIBUSB_ERROR_NO_DEVICE;
+		break;
+	case ERROR_BUSY:
+		r = LIBUSB_ERROR_BUSY;
+		break;
+	case ERROR_INVALID_PARAMETER:
+		r = LIBUSB_ERROR_INVALID_PARAM;
+		break;
+	default:
+		r = LIBUSB_ERROR_IO;
+		break;
+	}
+out:
+	usbi_mutex_unlock(&dev_handle->lock);
+	return r;
 }
 
 static int usbdk_claim_interface(struct libusb_device_handle *dev_handle, uint8_t iface)
 {
-	UNUSED(dev_handle);
+	struct usbdk_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
 	UNUSED(iface);
+	if (!priv->configuration_valid)
+		return LIBUSB_ERROR_IO;
+	if (priv->active_configuration == UINT8_MAX)
+		return LIBUSB_ERROR_NOT_FOUND;
 	return LIBUSB_SUCCESS;
 }
 
@@ -466,6 +561,10 @@ static int usbdk_set_interface_altsetting(struct libusb_device_handle *dev_handl
 {
 	struct usbdk_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
 
+	if (!priv->configuration_valid)
+		return LIBUSB_ERROR_IO;
+	if (priv->active_configuration == UINT8_MAX)
+		return LIBUSB_ERROR_NOT_FOUND;
 	if (!usbdk_helper.SetAltsetting(priv->redirector_handle, iface, altsetting)) {
 		usbi_err(HANDLE_CTX(dev_handle), "SetAltsetting failed: %s", windows_error_str(0));
 		return LIBUSB_ERROR_NO_DEVICE;
@@ -484,25 +583,37 @@ static int usbdk_release_interface(struct libusb_device_handle *dev_handle, uint
 static int usbdk_clear_halt(struct libusb_device_handle *dev_handle, unsigned char endpoint)
 {
 	struct usbdk_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
+	int r = LIBUSB_SUCCESS;
 
-	if (!usbdk_helper.ResetPipe(priv->redirector_handle, endpoint)) {
+	usbi_mutex_lock(&dev_handle->lock);
+	if (!priv->configuration_valid)
+		r = LIBUSB_ERROR_IO;
+	else if (priv->active_configuration == UINT8_MAX)
+		r = LIBUSB_ERROR_NOT_FOUND;
+	else if (!usbdk_helper.ResetPipe(priv->redirector_handle, endpoint)) {
 		usbi_err(HANDLE_CTX(dev_handle), "ResetPipe failed: %s", windows_error_str(0));
-		return LIBUSB_ERROR_NO_DEVICE;
+		r = LIBUSB_ERROR_NO_DEVICE;
 	}
-
-	return LIBUSB_SUCCESS;
+	usbi_mutex_unlock(&dev_handle->lock);
+	return r;
 }
 
 static int usbdk_reset_device(struct libusb_device_handle *dev_handle)
 {
 	struct usbdk_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
+	int r = LIBUSB_SUCCESS;
 
-	if (!usbdk_helper.ResetDevice(priv->redirector_handle)) {
+	usbi_mutex_lock(&dev_handle->lock);
+	if (!priv->configuration_valid)
+		r = LIBUSB_ERROR_IO;
+	else if (priv->active_configuration == UINT8_MAX)
+		r = LIBUSB_ERROR_NOT_FOUND;
+	else if (!usbdk_helper.ResetDevice(priv->redirector_handle)) {
 		usbi_err(HANDLE_CTX(dev_handle), "ResetDevice failed: %s", windows_error_str(0));
-		return LIBUSB_ERROR_NO_DEVICE;
+		r = LIBUSB_ERROR_NO_DEVICE;
 	}
-
-	return LIBUSB_SUCCESS;
+	usbi_mutex_unlock(&dev_handle->lock);
+	return r;
 }
 
 static void usbdk_destroy_device(struct libusb_device *dev)
@@ -653,6 +764,21 @@ static int usbdk_do_iso_transfer(struct usbi_transfer *itransfer)
 static int usbdk_submit_transfer(struct usbi_transfer *itransfer)
 {
 	struct libusb_transfer *transfer = USBI_TRANSFER_TO_LIBUSB_TRANSFER(itransfer);
+	struct usbdk_device_priv *priv = usbi_get_device_priv(transfer->dev_handle->dev);
+	int r = LIBUSB_SUCCESS;
+
+	usbi_mutex_lock(&transfer->dev_handle->lock);
+	if (!usbi_atomic_load(&transfer->dev_handle->dev->attached) || !priv->redirector_handle)
+		r = LIBUSB_ERROR_NO_DEVICE;
+	else if (transfer->type != LIBUSB_TRANSFER_TYPE_CONTROL) {
+		if (!priv->configuration_valid)
+			r = LIBUSB_ERROR_IO;
+		else if (priv->active_configuration == UINT8_MAX)
+			r = LIBUSB_ERROR_NOT_FOUND;
+	}
+	usbi_mutex_unlock(&transfer->dev_handle->lock);
+	if (r != LIBUSB_SUCCESS)
+		return r;
 
 	switch (transfer->type) {
 	case LIBUSB_TRANSFER_TYPE_CONTROL:

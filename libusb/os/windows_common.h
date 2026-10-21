@@ -237,7 +237,8 @@ struct usbdk_device_priv {
 	PUSB_CONFIGURATION_DESCRIPTOR *config_descriptors;
 	HANDLE redirector_handle;
 	HANDLE system_handle;
-	uint8_t active_configuration;
+	uint8_t active_configuration; /* descriptor index; UINT8_MAX means unconfigured */
+	bool configuration_valid;
 };
 
 struct winusb_device_priv {
