@@ -96,6 +96,28 @@ typedef BOOL (__cdecl *USBDK_SET_ALTSETTING)(
 	ULONG64 InterfaceIdx,
 	ULONG64 AltSettingIdx
 );
+
+/* Optional redirector protocol 1; older helpers/drivers do not implement it. */
+#define USBDK_REDIRECTOR_PROTOCOL_VERSION 1U
+#define USBDK_CAP_SET_CONFIGURATION 1U
+
+typedef struct USB_DK_REDIRECTOR_CAPABILITIES {
+	ULONG Size;
+	ULONG ProtocolVersion;
+	ULONG Capabilities;
+	ULONG Reserved;
+} USB_DK_REDIRECTOR_CAPABILITIES, *PUSB_DK_REDIRECTOR_CAPABILITIES;
+
+typedef BOOL (__cdecl *USBDK_GET_REDIRECTOR_CAPABILITIES)(
+	HANDLE DeviceHandle,
+	PUSB_DK_REDIRECTOR_CAPABILITIES Capabilities
+);
+
+typedef BOOL (__cdecl *USBDK_SET_CONFIGURATION)(
+	HANDLE DeviceHandle,
+	ULONG64 ConfigurationValue
+);
+
 typedef BOOL (__cdecl *USBDK_RESET_DEVICE)(
 	HANDLE DeviceHandle
 );

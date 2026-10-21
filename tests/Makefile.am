@@ -31,6 +31,10 @@ endif
 
 noinst_HEADERS = libusb_testlib.h
 noinst_PROGRAMS = stress stress_mt set_option init_context
+if OS_WINDOWS
+windows_usbdk_config_SOURCES = windows_usbdk_config.c
+noinst_PROGRAMS += windows_usbdk_config
+endif
 if OS_DARWIN
 noinst_PROGRAMS += macos
 endif
