@@ -3929,6 +3929,12 @@ static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_ha
 	int i, j;
 
 	CHECK_WINUSBX_AVAILABLE(sub_api);
+	if (sub_api != SUB_API_WINUSB) {
+		if (WinUSBX[sub_api].ResetDevice == NULL)
+			return LIBUSB_ERROR_NOT_SUPPORTED;
+		if (!HANDLE_VALID(handle_priv->interface_handle[0].api_handle))
+			return LIBUSB_ERROR_NOT_FOUND;
+	}
 
 	// Reset any available pipe (except control).
 	// priv->usb_interface[].endpoint and .nb_endpoints are written under
@@ -3960,10 +3966,27 @@ static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_ha
 	usbi_mutex_unlock(&priv->interface_lock);
 
 	// libusbK & libusb0 have the ability to issue an actual device reset
-	if ((sub_api != SUB_API_WINUSB) && (WinUSBX[sub_api].ResetDevice != NULL)) {
+	if (sub_api != SUB_API_WINUSB) {
 		winusb_handle = handle_priv->interface_handle[0].api_handle;
-		if (HANDLE_VALID(winusb_handle))
-			WinUSBX[sub_api].ResetDevice(winusb_handle);
+		if (!WinUSBX[sub_api].ResetDevice(winusb_handle)) {
+			DWORD error = GetLastError();
+			usbi_err(HANDLE_CTX(dev_handle), "ResetDevice failed: %s", windows_error_str(error));
+			switch (error) {
+			case ERROR_FILE_NOT_FOUND:
+			case ERROR_NO_SUCH_DEVICE:
+			case ERROR_DEVICE_NOT_CONNECTED:
+				return LIBUSB_ERROR_NO_DEVICE;
+			case ERROR_ACCESS_DENIED:
+				return LIBUSB_ERROR_ACCESS;
+			case ERROR_NOT_SUPPORTED:
+			case ERROR_INVALID_FUNCTION:
+				return LIBUSB_ERROR_NOT_SUPPORTED;
+			case ERROR_SEM_TIMEOUT:
+				return LIBUSB_ERROR_TIMEOUT;
+			default:
+				return LIBUSB_ERROR_IO;
+			}
+		}
 	}
 
 	return LIBUSB_SUCCESS;

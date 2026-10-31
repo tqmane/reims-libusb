@@ -36,7 +36,7 @@ $dll = Join-Path $destination 'libusb-1.0.dll'
 & $linker /nologo /DLL "/OUT:$dll" "/IMPLIB:$destination/libusb-1.0.lib" "/DEF:$source/libusb/libusb-1.0.def" @compiled kernel32.lib
 if ($LASTEXITCODE -ne 0) { throw 'DLL link failed.' }
 $rest = @($compiled | Where-Object { [IO.Path]::GetFileName($_) -ne 'os_windows_winusb.obj' })
-foreach ($test in @('windows_instance_id', 'windows_libusbk_loader')) {
+foreach ($test in @('windows_instance_id', 'windows_libusbk_loader', 'windows_reset_status')) {
     $fixture = Join-Path $objects "$test.obj"
     & $compiler @common (Join-Path $PSScriptRoot "$test.c") "/Fo$fixture"
     if ($LASTEXITCODE -ne 0) { throw "CPU fixture compilation failed: $test" }
