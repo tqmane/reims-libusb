@@ -35,13 +35,15 @@ foreach ($name in $sources) {
 $dll = Join-Path $destination 'libusb-1.0.dll'
 & $linker /nologo /DLL "/OUT:$dll" "/IMPLIB:$destination/libusb-1.0.lib" "/DEF:$source/libusb/libusb-1.0.def" @compiled kernel32.lib
 if ($LASTEXITCODE -ne 0) { throw 'DLL link failed.' }
-$fixture = Join-Path $objects 'windows_instance_id.obj'
-& $compiler @common (Join-Path $PSScriptRoot 'windows_instance_id.c') "/Fo$fixture"
-if ($LASTEXITCODE -ne 0) { throw 'CPU fixture compilation failed.' }
 $rest = @($compiled | Where-Object { [IO.Path]::GetFileName($_) -ne 'os_windows_winusb.obj' })
-$exe = Join-Path $destination 'windows_instance_id.exe'
-& $linker /nologo "/OUT:$exe" $fixture @rest kernel32.lib
-if ($LASTEXITCODE -ne 0) { throw 'CPU fixture link failed.' }
-& $exe
-if ($LASTEXITCODE -ne 0) { throw 'CPU fixture failed.' }
+foreach ($test in @('windows_instance_id', 'windows_libusbk_loader')) {
+    $fixture = Join-Path $objects "$test.obj"
+    & $compiler @common (Join-Path $PSScriptRoot "$test.c") "/Fo$fixture"
+    if ($LASTEXITCODE -ne 0) { throw "CPU fixture compilation failed: $test" }
+    $exe = Join-Path $destination "$test.exe"
+    & $linker /nologo "/OUT:$exe" $fixture @rest kernel32.lib
+    if ($LASTEXITCODE -ne 0) { throw "CPU fixture link failed: $test" }
+    & $exe
+    if ($LASTEXITCODE -ne 0) { throw "CPU fixture failed: $test" }
+}
 Write-Output "Built native DLL and passed no-device API fixture: $dll"

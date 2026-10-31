@@ -2911,6 +2911,48 @@ const struct windows_usb_api_backend usb_api_backend[USB_API_MAX] = {
 		}										\
 	} while (0)
 
+/* Only libusbK may be bundled beside this libusb DLL, never searched on PATH. */
+static HMODULE load_libusbk_library(void)
+{
+	static const WCHAR module_anchor = 0;
+	static const WCHAR filename[] = L"libusbK.dll";
+	WCHAR path[32768];
+	HMODULE module, library;
+	WCHAR *separator;
+	DWORD length;
+	size_t prefix;
+	const DWORD flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
+
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, &module_anchor, &module)) {
+		length = GetModuleFileNameW(module, path, ARRAYSIZE(path));
+		if (length > 0 && length < ARRAYSIZE(path) &&
+			(((path[0] >= L'A' && path[0] <= L'Z') ||
+			  (path[0] >= L'a' && path[0] <= L'z')) ?
+			 (path[1] == L':' && path[2] == L'\\') :
+			 (path[0] == L'\\' && path[1] == L'\\'))) {
+			separator = wcsrchr(path, L'\\');
+			if (separator != NULL) {
+				prefix = (size_t)(separator - path) + 1;
+				if (prefix + ARRAYSIZE(filename) <= ARRAYSIZE(path)) {
+					memcpy(path + prefix, filename, sizeof(filename));
+					library = LoadLibraryExW(path, NULL, flags);
+					if (library != NULL)
+						return library;
+				}
+			}
+		}
+	}
+	/* Preserve the stock System32 fallback, with the same restricted search. */
+	length = GetSystemDirectoryW(path, ARRAYSIZE(path));
+	if (length == 0 || length >= ARRAYSIZE(path) ||
+		length + 1 + ARRAYSIZE(filename) > ARRAYSIZE(path))
+		return NULL;
+	path[length++] = L'\\';
+	memcpy(path + length, filename, sizeof(filename));
+	return LoadLibraryExW(path, NULL, flags);
+}
+
 static bool winusbx_init(struct libusb_context *ctx)
 {
 	HMODULE hWinUSB, hlibusbK;
@@ -2955,7 +2997,7 @@ cleanup_winusb:
 		usbi_info(ctx, "WinUSB DLL is not available");
 	}
 
-	hlibusbK = load_system_library(ctx, "libusbK");
+	hlibusbK = load_libusbk_library();
 	if (hlibusbK != NULL) {
 		LibK_GetVersion_t pLibK_GetVersion;
 		LibK_GetProcAddress_t pLibK_GetProcAddress;
