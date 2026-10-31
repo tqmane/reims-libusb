@@ -186,6 +186,7 @@ static bool init_dlls(struct libusb_context *ctx)
 	DLL_GET_HANDLE(ctx, Cfgmgr32);
 	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Parent, true);
 	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Child, true);
+	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Device_IDW, false);
 
 	// Prefixed to avoid conflict with header files
 	DLL_GET_HANDLE(ctx, AdvAPI32);
@@ -211,6 +212,47 @@ static void exit_dlls(void)
 	DLL_FREE_HANDLE(SetupAPI);
 	DLL_FREE_HANDLE(AdvAPI32);
 	DLL_FREE_HANDLE(Cfgmgr32);
+}
+
+int API_EXPORTED reims_libusb_get_windows_instance_id(libusb_device *dev,
+	char *buffer, int size)
+{
+	struct windows_context_priv *context_priv;
+	WCHAR instance_id[200] = { 0 }; /* MAX_DEVICE_ID_LEN, including NUL. */
+	CONFIGRET status;
+	int required;
+
+	if (buffer != NULL && size > 0)
+		buffer[0] = '\0';
+	if (dev == NULL || dev->ctx == NULL || buffer == NULL || size <= 0)
+		return LIBUSB_ERROR_INVALID_PARAM;
+	context_priv = usbi_get_context_priv(dev->ctx);
+	if (context_priv->backend != &winusb_backend || CM_Get_Device_IDW == NULL)
+		return LIBUSB_ERROR_NOT_SUPPORTED;
+	if (!usbi_atomic_load(&dev->attached) || dev->session_data == 0)
+		return LIBUSB_ERROR_NO_DEVICE;
+	/* windows_get_device_list uses the physical DevInst as session_data. */
+	status = CM_Get_Device_IDW((DEVINST)dev->session_data, instance_id,
+		ARRAYSIZE(instance_id), 0);
+	if (status == CR_NO_SUCH_DEVNODE)
+		return LIBUSB_ERROR_NO_DEVICE;
+	if (status == CR_BUFFER_SMALL)
+		return LIBUSB_ERROR_OVERFLOW;
+	if (status != CR_SUCCESS || instance_id[0] == L'\0' ||
+		instance_id[ARRAYSIZE(instance_id) - 1] != L'\0')
+		return LIBUSB_ERROR_IO;
+	required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, instance_id,
+		-1, NULL, 0, NULL, NULL);
+	if (required == 0)
+		return LIBUSB_ERROR_IO;
+	if (required > size)
+		return LIBUSB_ERROR_OVERFLOW;
+	if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, instance_id,
+		-1, buffer, size, NULL, NULL) != required) {
+		buffer[0] = '\0';
+		return LIBUSB_ERROR_IO;
+	}
+	return LIBUSB_SUCCESS;
 }
 
 /*
