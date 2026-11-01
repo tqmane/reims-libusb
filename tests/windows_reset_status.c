@@ -6,6 +6,26 @@
 
 static DWORD failure;
 static unsigned int calls;
+static DWORD initialize_failure;
+static unsigned int initialized, freed;
+
+static BOOL WINAPI initialize(HANDLE file, HANDLE *handle)
+{
+	CHECK(file == (HANDLE)(uintptr_t)84);
+	initialized++;
+	SetLastError(initialize_failure);
+	if (initialize_failure != ERROR_SUCCESS)
+		return FALSE;
+	*handle = (HANDLE)(uintptr_t)42;
+	return TRUE;
+}
+
+static BOOL WINAPI release(HANDLE handle)
+{
+	CHECK(handle == (HANDLE)(uintptr_t)42);
+	freed++;
+	return TRUE;
+}
 
 static BOOL WINAPI reset(HANDLE handle)
 {
@@ -36,6 +56,8 @@ int main(void)
 	usbi_mutex_init(&priv->interface_lock);
 	for (api = SUB_API_LIBUSBK; api <= SUB_API_LIBUSB0; api++) {
 		WinUSBX[api].hDll = (HMODULE)(uintptr_t)1;
+		WinUSBX[api].Initialize = initialize;
+		WinUSBX[api].Free = release;
 		CHECK(winusbx_reset_device(api, handle) == LIBUSB_ERROR_NOT_SUPPORTED);
 		WinUSBX[api].ResetDevice = reset;
 		CHECK(winusbx_reset_device(api, handle) == LIBUSB_ERROR_NOT_FOUND && calls == 0);
@@ -47,8 +69,27 @@ int main(void)
 			CHECK(winusbx_reset_device(api, handle) == expected[i]);
 		}
 		CHECK(calls == 1 + ARRAYSIZE(errors));
+		CHECK(initialized == 0 && freed == 0);
 		opened->interface_handle[0].api_handle = NULL;
 		calls = 0;
+		opened->interface_handle[0].dev_handle = (HANDLE)(uintptr_t)84;
+		handle->claimed_interfaces = 0x80;
+		failure = ERROR_SUCCESS;
+		CHECK(winusbx_reset_device(api, handle) == LIBUSB_SUCCESS);
+		CHECK(calls == 1 && initialized == 1 && freed == 1);
+		CHECK(opened->interface_handle[0].api_handle == NULL && handle->claimed_interfaces == 0x80);
+		for (i = 0; i < ARRAYSIZE(errors); i++) {
+			failure = errors[i];
+			CHECK(winusbx_reset_device(api, handle) == expected[i]);
+			CHECK(initialized == 2 + i && freed == initialized);
+			CHECK(opened->interface_handle[0].api_handle == NULL && handle->claimed_interfaces == 0x80);
+		}
+		initialize_failure = ERROR_ACCESS_DENIED;
+		CHECK(winusbx_reset_device(api, handle) == LIBUSB_ERROR_ACCESS);
+		CHECK(calls == 1 + ARRAYSIZE(errors) && initialized == freed + 1);
+		initialize_failure = ERROR_SUCCESS;
+		opened->interface_handle[0].dev_handle = NULL;
+		calls = initialized = freed = 0;
 	}
 	WinUSBX[SUB_API_WINUSB].hDll = (HMODULE)(uintptr_t)1;
 	CHECK(winusbx_reset_device(SUB_API_WINUSB, handle) == 0 && calls == 0);
@@ -56,6 +97,6 @@ int main(void)
 	free(handle);
 	free(dev);
 	free(ctx);
-	puts("Physical Windows reset status: real success, missing API/handle and driver failures PASS (no device calls)");
+	puts("Physical Windows reset: pre-claim API handle lifetime, real success and driver failures PASS (no device calls)");
 	return 0;
 }

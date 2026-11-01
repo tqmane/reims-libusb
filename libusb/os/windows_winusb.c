@@ -3926,14 +3926,17 @@ static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_ha
 	struct winusb_device_handle_priv *handle_priv = get_winusb_device_handle_priv(dev_handle);
 	struct winusb_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
 	HANDLE winusb_handle;
+	HANDLE reset_handle = INVALID_HANDLE_VALUE;
+	bool temporary_handle = false;
+	const char *operation = "ResetDevice";
+	DWORD error;
+	int result = LIBUSB_SUCCESS;
 	int i, j;
 
 	CHECK_WINUSBX_AVAILABLE(sub_api);
 	if (sub_api != SUB_API_WINUSB) {
 		if (WinUSBX[sub_api].ResetDevice == NULL)
 			return LIBUSB_ERROR_NOT_SUPPORTED;
-		if (!HANDLE_VALID(handle_priv->interface_handle[0].api_handle))
-			return LIBUSB_ERROR_NOT_FOUND;
 	}
 
 	// Reset any available pipe (except control).
@@ -3942,6 +3945,22 @@ static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_ha
 	// take the lock so we don't read a freed endpoint pointer or an
 	// inconsistent (nb_endpoints, endpoint[]) pair.
 	usbi_mutex_lock(&priv->interface_lock);
+	if (sub_api != SUB_API_WINUSB) {
+		reset_handle = handle_priv->interface_handle[0].api_handle;
+		if (!HANDLE_VALID(reset_handle)) {
+			/* A bus reset may precede the first control transfer/interface claim. */
+			HANDLE file_handle = handle_priv->interface_handle[0].dev_handle;
+			if (!HANDLE_VALID(file_handle)) {
+				result = LIBUSB_ERROR_NOT_FOUND;
+				goto done;
+			}
+			if (!WinUSBX[sub_api].Initialize(file_handle, &reset_handle)) {
+				operation = "Initialize for ResetDevice";
+				goto failed;
+			}
+			temporary_handle = true;
+		}
+	}
 	for (i = 0; i < USB_MAXINTERFACES; i++) {
 		winusb_handle = handle_priv->interface_handle[i].api_handle;
 		if (HANDLE_VALID(winusb_handle)) {
@@ -3963,33 +3982,41 @@ static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_ha
 			}
 		}
 	}
-	usbi_mutex_unlock(&priv->interface_lock);
-
 	// libusbK & libusb0 have the ability to issue an actual device reset
 	if (sub_api != SUB_API_WINUSB) {
-		winusb_handle = handle_priv->interface_handle[0].api_handle;
-		if (!WinUSBX[sub_api].ResetDevice(winusb_handle)) {
-			DWORD error = GetLastError();
-			usbi_err(HANDLE_CTX(dev_handle), "ResetDevice failed: %s", windows_error_str(error));
-			switch (error) {
-			case ERROR_FILE_NOT_FOUND:
-			case ERROR_NO_SUCH_DEVICE:
-			case ERROR_DEVICE_NOT_CONNECTED:
-				return LIBUSB_ERROR_NO_DEVICE;
-			case ERROR_ACCESS_DENIED:
-				return LIBUSB_ERROR_ACCESS;
-			case ERROR_NOT_SUPPORTED:
-			case ERROR_INVALID_FUNCTION:
-				return LIBUSB_ERROR_NOT_SUPPORTED;
-			case ERROR_SEM_TIMEOUT:
-				return LIBUSB_ERROR_TIMEOUT;
-			default:
-				return LIBUSB_ERROR_IO;
-			}
-		}
+		if (!WinUSBX[sub_api].ResetDevice(reset_handle))
+			goto failed;
 	}
+	goto done;
 
-	return LIBUSB_SUCCESS;
+failed:
+	error = GetLastError();
+	usbi_err(HANDLE_CTX(dev_handle), "%s failed: %s", operation, windows_error_str(error));
+	switch (error) {
+	case ERROR_FILE_NOT_FOUND:
+	case ERROR_NO_SUCH_DEVICE:
+	case ERROR_DEVICE_NOT_CONNECTED:
+		result = LIBUSB_ERROR_NO_DEVICE;
+		break;
+	case ERROR_ACCESS_DENIED:
+		result = LIBUSB_ERROR_ACCESS;
+		break;
+	case ERROR_NOT_SUPPORTED:
+	case ERROR_INVALID_FUNCTION:
+		result = LIBUSB_ERROR_NOT_SUPPORTED;
+		break;
+	case ERROR_SEM_TIMEOUT:
+		result = LIBUSB_ERROR_TIMEOUT;
+		break;
+	default:
+		result = LIBUSB_ERROR_IO;
+		break;
+	}
+done:
+	if (temporary_handle)
+		WinUSBX[sub_api].Free(reset_handle);
+	usbi_mutex_unlock(&priv->interface_lock);
+	return result;
 }
 
 static enum libusb_transfer_status winusbx_copy_transfer_data(int sub_api, struct usbi_transfer *itransfer, DWORD length)
