@@ -1794,6 +1794,16 @@ LIBUSB_DEPRECATED_FOR(libusb_get_port_numbers)
 int LIBUSB_CALL libusb_get_port_path(libusb_context *ctx, libusb_device *dev, uint8_t *path, uint8_t path_length);
 libusb_device * LIBUSB_CALL libusb_get_parent(libusb_device *dev);
 uint8_t LIBUSB_CALL libusb_get_device_address(libusb_device *dev);
+#if defined(_WIN32) || defined(__CYGWIN__)
+/** Reims Windows extension: copy the physical PnP instance ID as NUL-terminated
+ * UTF-8 without opening the device. A live native Windows backend device is
+ * required; UsbDk is not supported. Returns LIBUSB_SUCCESS, INVALID_PARAM,
+ * NOT_SUPPORTED, NO_DEVICE, OVERFLOW (including room for NUL), or IO.
+ * On error a valid nonempty output buffer is cleared; no truncated ID is valid.
+ */
+int LIBUSB_CALL reims_libusb_get_windows_instance_id(libusb_device *dev,
+	char *buffer, int size);
+#endif
 int LIBUSB_CALL libusb_get_device_speed(libusb_device *dev);
 int LIBUSB_CALL libusb_get_max_packet_size(libusb_device *dev,
 	unsigned char endpoint);

@@ -186,6 +186,7 @@ static bool init_dlls(struct libusb_context *ctx)
 	DLL_GET_HANDLE(ctx, Cfgmgr32);
 	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Parent, true);
 	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Child, true);
+	DLL_LOAD_FUNC(Cfgmgr32, CM_Get_Device_IDW, false);
 
 	// Prefixed to avoid conflict with header files
 	DLL_GET_HANDLE(ctx, AdvAPI32);
@@ -211,6 +212,47 @@ static void exit_dlls(void)
 	DLL_FREE_HANDLE(SetupAPI);
 	DLL_FREE_HANDLE(AdvAPI32);
 	DLL_FREE_HANDLE(Cfgmgr32);
+}
+
+int API_EXPORTED reims_libusb_get_windows_instance_id(libusb_device *dev,
+	char *buffer, int size)
+{
+	struct windows_context_priv *context_priv;
+	WCHAR instance_id[200] = { 0 }; /* MAX_DEVICE_ID_LEN, including NUL. */
+	CONFIGRET status;
+	int required;
+
+	if (buffer != NULL && size > 0)
+		buffer[0] = '\0';
+	if (dev == NULL || dev->ctx == NULL || buffer == NULL || size <= 0)
+		return LIBUSB_ERROR_INVALID_PARAM;
+	context_priv = usbi_get_context_priv(dev->ctx);
+	if (context_priv->backend != &winusb_backend || CM_Get_Device_IDW == NULL)
+		return LIBUSB_ERROR_NOT_SUPPORTED;
+	if (!usbi_atomic_load(&dev->attached) || dev->session_data == 0)
+		return LIBUSB_ERROR_NO_DEVICE;
+	/* windows_get_device_list uses the physical DevInst as session_data. */
+	status = CM_Get_Device_IDW((DEVINST)dev->session_data, instance_id,
+		ARRAYSIZE(instance_id), 0);
+	if (status == CR_NO_SUCH_DEVNODE)
+		return LIBUSB_ERROR_NO_DEVICE;
+	if (status == CR_BUFFER_SMALL)
+		return LIBUSB_ERROR_OVERFLOW;
+	if (status != CR_SUCCESS || instance_id[0] == L'\0' ||
+		instance_id[ARRAYSIZE(instance_id) - 1] != L'\0')
+		return LIBUSB_ERROR_IO;
+	required = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, instance_id,
+		-1, NULL, 0, NULL, NULL);
+	if (required == 0)
+		return LIBUSB_ERROR_IO;
+	if (required > size)
+		return LIBUSB_ERROR_OVERFLOW;
+	if (WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, instance_id,
+		-1, buffer, size, NULL, NULL) != required) {
+		buffer[0] = '\0';
+		return LIBUSB_ERROR_IO;
+	}
+	return LIBUSB_SUCCESS;
 }
 
 /*
@@ -2869,6 +2911,48 @@ const struct windows_usb_api_backend usb_api_backend[USB_API_MAX] = {
 		}										\
 	} while (0)
 
+/* Only libusbK may be bundled beside this libusb DLL, never searched on PATH. */
+static HMODULE load_libusbk_library(void)
+{
+	static const WCHAR module_anchor = 0;
+	static const WCHAR filename[] = L"libusbK.dll";
+	WCHAR path[32768];
+	HMODULE module, library;
+	WCHAR *separator;
+	DWORD length;
+	size_t prefix;
+	const DWORD flags = LOAD_LIBRARY_SEARCH_DLL_LOAD_DIR | LOAD_LIBRARY_SEARCH_SYSTEM32;
+
+	if (GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+		GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, &module_anchor, &module)) {
+		length = GetModuleFileNameW(module, path, ARRAYSIZE(path));
+		if (length > 0 && length < ARRAYSIZE(path) &&
+			(((path[0] >= L'A' && path[0] <= L'Z') ||
+			  (path[0] >= L'a' && path[0] <= L'z')) ?
+			 (path[1] == L':' && path[2] == L'\\') :
+			 (path[0] == L'\\' && path[1] == L'\\'))) {
+			separator = wcsrchr(path, L'\\');
+			if (separator != NULL) {
+				prefix = (size_t)(separator - path) + 1;
+				if (prefix + ARRAYSIZE(filename) <= ARRAYSIZE(path)) {
+					memcpy(path + prefix, filename, sizeof(filename));
+					library = LoadLibraryExW(path, NULL, flags);
+					if (library != NULL)
+						return library;
+				}
+			}
+		}
+	}
+	/* Preserve the stock System32 fallback, with the same restricted search. */
+	length = GetSystemDirectoryW(path, ARRAYSIZE(path));
+	if (length == 0 || length >= ARRAYSIZE(path) ||
+		length + 1 + ARRAYSIZE(filename) > ARRAYSIZE(path))
+		return NULL;
+	path[length++] = L'\\';
+	memcpy(path + length, filename, sizeof(filename));
+	return LoadLibraryExW(path, NULL, flags);
+}
+
 static bool winusbx_init(struct libusb_context *ctx)
 {
 	HMODULE hWinUSB, hlibusbK;
@@ -2913,7 +2997,7 @@ cleanup_winusb:
 		usbi_info(ctx, "WinUSB DLL is not available");
 	}
 
-	hlibusbK = load_system_library(ctx, "libusbK");
+	hlibusbK = load_libusbk_library();
 	if (hlibusbK != NULL) {
 		LibK_GetVersion_t pLibK_GetVersion;
 		LibK_GetProcAddress_t pLibK_GetProcAddress;
@@ -3842,9 +3926,18 @@ static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_ha
 	struct winusb_device_handle_priv *handle_priv = get_winusb_device_handle_priv(dev_handle);
 	struct winusb_device_priv *priv = usbi_get_device_priv(dev_handle->dev);
 	HANDLE winusb_handle;
+	HANDLE reset_handle = INVALID_HANDLE_VALUE;
+	bool temporary_handle = false;
+	const char *operation = "ResetDevice";
+	DWORD error;
+	int result = LIBUSB_SUCCESS;
 	int i, j;
 
 	CHECK_WINUSBX_AVAILABLE(sub_api);
+	if (sub_api != SUB_API_WINUSB) {
+		if (WinUSBX[sub_api].ResetDevice == NULL)
+			return LIBUSB_ERROR_NOT_SUPPORTED;
+	}
 
 	// Reset any available pipe (except control).
 	// priv->usb_interface[].endpoint and .nb_endpoints are written under
@@ -3852,6 +3945,22 @@ static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_ha
 	// take the lock so we don't read a freed endpoint pointer or an
 	// inconsistent (nb_endpoints, endpoint[]) pair.
 	usbi_mutex_lock(&priv->interface_lock);
+	if (sub_api != SUB_API_WINUSB) {
+		reset_handle = handle_priv->interface_handle[0].api_handle;
+		if (!HANDLE_VALID(reset_handle)) {
+			/* A bus reset may precede the first control transfer/interface claim. */
+			HANDLE file_handle = handle_priv->interface_handle[0].dev_handle;
+			if (!HANDLE_VALID(file_handle)) {
+				result = LIBUSB_ERROR_NOT_FOUND;
+				goto done;
+			}
+			if (!WinUSBX[sub_api].Initialize(file_handle, &reset_handle)) {
+				operation = "Initialize for ResetDevice";
+				goto failed;
+			}
+			temporary_handle = true;
+		}
+	}
 	for (i = 0; i < USB_MAXINTERFACES; i++) {
 		winusb_handle = handle_priv->interface_handle[i].api_handle;
 		if (HANDLE_VALID(winusb_handle)) {
@@ -3873,16 +3982,41 @@ static int winusbx_reset_device(int sub_api, struct libusb_device_handle *dev_ha
 			}
 		}
 	}
-	usbi_mutex_unlock(&priv->interface_lock);
-
 	// libusbK & libusb0 have the ability to issue an actual device reset
-	if ((sub_api != SUB_API_WINUSB) && (WinUSBX[sub_api].ResetDevice != NULL)) {
-		winusb_handle = handle_priv->interface_handle[0].api_handle;
-		if (HANDLE_VALID(winusb_handle))
-			WinUSBX[sub_api].ResetDevice(winusb_handle);
+	if (sub_api != SUB_API_WINUSB) {
+		if (!WinUSBX[sub_api].ResetDevice(reset_handle))
+			goto failed;
 	}
+	goto done;
 
-	return LIBUSB_SUCCESS;
+failed:
+	error = GetLastError();
+	usbi_err(HANDLE_CTX(dev_handle), "%s failed: %s", operation, windows_error_str(error));
+	switch (error) {
+	case ERROR_FILE_NOT_FOUND:
+	case ERROR_NO_SUCH_DEVICE:
+	case ERROR_DEVICE_NOT_CONNECTED:
+		result = LIBUSB_ERROR_NO_DEVICE;
+		break;
+	case ERROR_ACCESS_DENIED:
+		result = LIBUSB_ERROR_ACCESS;
+		break;
+	case ERROR_NOT_SUPPORTED:
+	case ERROR_INVALID_FUNCTION:
+		result = LIBUSB_ERROR_NOT_SUPPORTED;
+		break;
+	case ERROR_SEM_TIMEOUT:
+		result = LIBUSB_ERROR_TIMEOUT;
+		break;
+	default:
+		result = LIBUSB_ERROR_IO;
+		break;
+	}
+done:
+	if (temporary_handle)
+		WinUSBX[sub_api].Free(reset_handle);
+	usbi_mutex_unlock(&priv->interface_lock);
+	return result;
 }
 
 static enum libusb_transfer_status winusbx_copy_transfer_data(int sub_api, struct usbi_transfer *itransfer, DWORD length)

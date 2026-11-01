@@ -1,5 +1,7 @@
 LIBRARY "libusb-1.0.dll"
 EXPORTS
+  reims_libusb_get_windows_instance_id
+  reims_libusb_get_windows_instance_id@12 = reims_libusb_get_windows_instance_id
   libusb_alloc_streams
   libusb_alloc_streams@16 = libusb_alloc_streams
   libusb_alloc_transfer
